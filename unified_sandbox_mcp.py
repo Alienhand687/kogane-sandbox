@@ -17,7 +17,7 @@ STATE_STORE: Dict[str, Dict[str, Any]] = {
     "tenancies": {},
     "vaults": {},
     "inspections": {},
-    "covenants": {}
+    "covenants": {},
     "audit_trail": []
 }
 
