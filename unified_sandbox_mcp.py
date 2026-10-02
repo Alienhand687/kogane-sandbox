@@ -18,6 +18,7 @@ STATE_STORE: Dict[str, Dict[str, Any]] = {
     "vaults": {},
     "inspections": {},
     "covenants": {}
+    "audit_trail": []
 }
 
 STATIC_FIXTURES: Dict[str, Dict[str, Any]] = {
@@ -444,6 +445,43 @@ async def dispatch_whatsapp_hsm(
         "timer_armed": True,
         "legal_implication": "If no dispute is logged before deadline, Section 10A covenant becomes binding automatically."
     })
-
+# AUDIT & LEDGER LOGGING TOOL (GOOGLE SHEETS REPLACEMENT)
+@mcp.tool(
+    name="append_google_sheet_row",
+    description="Appends an immutable audit record row to the central tenancy decision ledger."
+)
+async def append_google_sheet_row(
+    tenancy_id: str = Field(description="Unique lease UUID"),
+    state_before: str = Field(description="State machine status before the decision"),
+    trigger_event_id: str = Field(description="ID of the event that triggered the turn"),
+    evidence_used: str = Field(description="Hashes and IDs of evidence evaluated"),
+    decision: str = Field(description="Exact decision code executed"),
+    rule_id: str = Field(description="Rule ID governing the decision (e.g., I1, Gate-5)"),
+    tool_called: str = Field(default="NONE", description="Name of the tool executed, or NONE"),
+    idempotency_key: str = Field(default="NONE", description="Idempotency key of the action"),
+    result: str = Field(default="SUCCESS", description="Outcome description or status code"),
+    state_after: str = Field(default="SAME", description="State machine status after transition")
+) -> str:
+    audit_row = {
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "tenancy_id": tenancy_id,
+        "state_before": state_before,
+        "trigger_event_id": trigger_event_id,
+        "evidence_used": evidence_used,
+        "decision": decision,
+        "rule_id": rule_id,
+        "tool": tool_called,
+        "idempotency_key": idempotency_key,
+        "result": result,
+        "state_after": state_after
+    }
+    STATE_STORE.setdefault("audit_trail", []).append(audit_row)
+    
+    return json.dumps({
+        "status": "AUDIT_ROW_COMMITTED",
+        "row_index": len(STATE_STORE["audit_trail"]),
+        "audit_hash": hashlib.sha256(json.dumps(audit_row).encode()).hexdigest(),
+        "logged_at_utc": audit_row["timestamp_utc"]
+    })
 if __name__ == "__main__":
     mcp.run(transport="sse")
