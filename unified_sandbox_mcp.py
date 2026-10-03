@@ -148,6 +148,11 @@ async def create_tripartite_vault(
     auth = verify_grantex_authorization("create_tripartite_vault", grantex_token)
     if not auth["authorized"]:
         return json.dumps({"status": "GRANTEX_ACCESS_DENIED", "error": auth["error"], "required_scope": auth["scope_checked"]})
+    if deposit_amount_inr > 1000000.0:
+        return json.dumps({
+            "status": "DEPOSIT_LIMIT_EXCEEDED",
+            "error": "DEPOSIT_LIMIT_EXCEEDED: Security deposit exceeds Rs 10,00,000 ceiling. Requires multi-sig KYC approval."
+        })
     vault_id = f"VAULT_{tenancy_id.upper()[:8]}_{int(deposit_amount_inr)}"
     record = {
         "vault_id": vault_id,
@@ -159,12 +164,12 @@ async def create_tripartite_vault(
         "disputed_subvault_inr": 0.0,
         "latent_defect_bond_inr": 0.0,
         "accrued_yield_inr": 0.0,
-        "status": "VAULT_LOCKED",
+        "status": "VAULT_INITIALIZED",
         "created_at_utc": datetime.now(timezone.utc).isoformat()
     }
     STATE_STORE["vaults"][vault_id] = record
     STATE_STORE["tenancies"][tenancy_id] = {"vault_id": vault_id, "status": "ACTIVE_TENANCY"}
-    return json.dumps({"status": "VAULT_INITIALIZED", **record})
+    return json.dumps(record)
 
 @mcp.tool(
     name="trigger_treps_sweep",
@@ -311,15 +316,50 @@ async def dispatch_delhivery_rvp(
     auth = verify_grantex_authorization("dispatch_delhivery_rvp", grantex_token)
     if not auth["authorized"]:
         return json.dumps({"status": "GRANTEX_ACCESS_DENIED", "error": auth["error"], "required_scope": auth["scope_checked"]})
+    
+    if inspection_type not in ["MOVE_OUT_AUDIT", "SUPERVISORY_RESCAN"]:
+        return json.dumps({
+            "status": "INVALID_INSPECTION_TYPE",
+            "error": f"INVALID_INSPECTION_TYPE: '{inspection_type}' is not supported. Must be 'MOVE_OUT_AUDIT' or 'SUPERVISORY_RESCAN'."
+        })
+
     if pincode == "000000":
         return json.dumps({"status": "SERVICEABILITY_DEFICIT", "error": "PIN code not serviceable by primary fleet."})
 
-    return json.dumps({
-        "status": "DISPATCHED",
-        "waybill": f"DEL_RVP_{pincode}_{tenancy_id[:6].upper()}",
+    if not (isinstance(pincode, str) and pincode.isdigit() and len(pincode) == 6):
+        return json.dumps({
+            "status": "INVALID_PINCODE",
+            "error": f"INVALID_PINCODE: '{pincode}' must be a 6-digit postal PIN code."
+        })
+
+    cache_key = f"dispatch_{tenancy_id}_{inspection_type}"
+    inspections = STATE_STORE.setdefault("inspections", {})
+    if cache_key in inspections:
+        cached = inspections[cache_key]
+        return json.dumps({
+            "status": "ALREADY_DISPATCHED",
+            "waybill": cached["waybill"],
+            "assigned_agent_id": cached["assigned_agent_id"],
+            "eta": cached["eta"],
+            "inspection_protocol": cached["inspection_protocol"]
+        })
+
+    hex_part = hashlib.sha256(f"{tenancy_id}_{inspection_type}_{pincode}".encode()).hexdigest()[:8].upper()
+    waybill = f"DEL_RVP_{pincode}_{hex_part}"
+    record = {
+        "waybill": waybill,
         "assigned_agent_id": "DEL_AGENT_BLR_404",
         "eta": "25 mins (Simulated)",
         "inspection_protocol": "BLIND_AR_SLAM_SWEEP"
+    }
+    inspections[cache_key] = record
+
+    return json.dumps({
+        "status": "DISPATCHED",
+        "waybill": waybill,
+        "assigned_agent_id": record["assigned_agent_id"],
+        "eta": record["eta"],
+        "inspection_protocol": record["inspection_protocol"]
     })
 
 @mcp.tool(
@@ -376,6 +416,7 @@ async def compute_pointcloud_delta(
     return json.dumps({
         "status": "DELTA_COMPUTED",
         "tenancy_id": tenancy_id,
+        "coverage_pct": fixture.get("coverage_pct", 99.5),
         "gross_discrepancies_found": len(fixture["anomalies"]),
         "anomalies": fixture["anomalies"],
         "mesh_drift_pct": fixture["drift_pct"]
@@ -394,27 +435,61 @@ async def apply_cpwd_depreciation(
     auth = verify_grantex_authorization("apply_cpwd_depreciation", grantex_token)
     if not auth["authorized"]:
         return json.dumps({"status": "GRANTEX_ACCESS_DENIED", "error": auth["error"], "required_scope": auth["scope_checked"]})
-    anomalies_list = json.loads(raw_anomalies) if isinstance(raw_anomalies, str) else raw_anomalies
+    
+    try:
+        anomalies_list = json.loads(raw_anomalies) if isinstance(raw_anomalies, str) else raw_anomalies
+        if not isinstance(anomalies_list, list):
+            return json.dumps({"status": "MALFORMED_JSON_PAYLOAD", "error": "raw_anomalies must be a JSON array"})
+    except Exception:
+        return json.dumps({"status": "MALFORMED_JSON_PAYLOAD", "error": "Malformed JSON payload in raw_anomalies"})
+
+    cpwd_lifespans = {
+        "PAINT_WALL": 24,
+        "FLOOR_TILE": 120,
+        "FIXTURE_PLUMBING": 60,
+        "FIXTURE_ELECTRICAL": 60,
+        "CARPENTRY_DOOR": 60
+    }
     results = []
 
     for item in anomalies_list:
-        cat = item.get("surface_category", "UNKNOWN")
-        raw_cost = item.get("raw_repair_cost_inr", item.get("claimed_repair_cost_inr", 0.0))
+        if not isinstance(item, dict):
+            return json.dumps({"status": "INVALID_ANOMALY_PAYLOAD", "error": "Item in raw_anomalies must be an object"})
 
-        lifespan = 24 if cat == "PAINT_WALL" else (120 if cat == "FLOOR_TILE" else 60)
+        cat = item.get("surface_category")
+        if not cat or cat not in cpwd_lifespans:
+            return json.dumps({
+                "status": "UNRECOGNIZED_SURFACE_CATEGORY",
+                "error": f"UNRECOGNIZED_SURFACE_CATEGORY: Surface category '{cat}' is not in statutory CPWD schedule."
+            })
+        lifespan = cpwd_lifespans[cat]
+
+        if "raw_repair_cost_inr" not in item:
+            return json.dumps({
+                "status": "INVALID_ANOMALY_PAYLOAD",
+                "error": "INVALID_ANOMALY_PAYLOAD: Missing required field 'raw_repair_cost_inr'."
+            })
+
+        raw_cost = item["raw_repair_cost_inr"]
+        if raw_cost is None or not isinstance(raw_cost, (int, float)) or raw_cost < 0.0:
+            return json.dumps({
+                "status": "INVALID_ANOMALY_PAYLOAD",
+                "error": f"INVALID_ANOMALY_PAYLOAD: Invalid raw_repair_cost_inr '{raw_cost}'."
+            })
+        raw_cost = float(raw_cost)
 
         if tenancy_duration_months >= lifespan:
             factor = 0.0
             rationale = f"CPWD statutory lifespan ({lifespan}m) exceeded. Classified as 100% normal wear-and-tear."
         else:
-            factor = round(1.0 - (tenancy_duration_months / lifespan), 2)
+            factor = max(0.0, 1.0 - (tenancy_duration_months / lifespan))
             rationale = f"Depreciated via CPWD schedule ({tenancy_duration_months}/{lifespan} months consumed)."
 
         allowable = round(raw_cost * factor, 2)
         results.append({
             "surface_category": cat,
             "raw_cost_inr": raw_cost,
-            "depreciation_factor": factor,
+            "depreciation_factor": round(factor, 4),
             "allowable_deduction_inr": allowable,
             "statutory_rationale": rationale
         })
@@ -442,15 +517,23 @@ async def query_sor_ceiling(
         "PAINTING": {"labor": 1200.0, "material": 1800.0, "total": 3000.0},
         "FLOORING": {"labor": 1500.0, "material": 2500.0, "total": 4000.0},
         "PLUMBING": {"labor": 450.0, "material": 350.0, "total": 800.0},
-        "ELECTRICAL": {"labor": 500.0, "material": 600.0, "total": 1100.0}
+        "ELECTRICAL": {"labor": 500.0, "material": 600.0, "total": 1100.0},
+        "CARPENTRY": {"labor": 1000.0, "material": 1500.0, "total": 2500.0}
     }
-    caps = rate_table.get(trade_category.upper(), {"labor": 500.0, "material": 500.0, "total": 1000.0})
+    trade_upper = trade_category.upper()
+    if trade_upper not in rate_table:
+        return json.dumps({
+            "status": "SOR_CATEGORY_NOT_FOUND",
+            "error": f"SOR_CATEGORY_NOT_FOUND: Trade category '{trade_category}' not recognized in Urban Company SOR."
+        })
+    caps = rate_table[trade_upper]
     return json.dumps({
         "pincode": pincode,
         "trade_category": trade_category,
         "max_allowable_labor_inr": caps["labor"],
         "max_allowable_material_inr": caps["material"],
-        "total_ceiling_cap_inr": caps["total"]
+        "total_ceiling_cap_inr": caps["total"],
+        "rate_source": "URBAN_COMPANY_SOR_V4_REST_API"
     })
 
 # ============================================================================
