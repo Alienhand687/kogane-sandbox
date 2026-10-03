@@ -605,30 +605,34 @@ from typing import Optional
 from mcp.server.fastmcp import FastMCP
 from pydantic import Field
 
+# ============================================================================
+# AGENT 3: COVENANT & LEGAL TOOLS (DEFENSIVE SCHEMAS & RESILIENT MOCKS)
+# ============================================================================
+
 @mcp.tool(
     name="strip_sentiment_bias",
     description="Strips hostility and retaliatory threats, normalizes prose, and dynamically extracts structured legal covenant parameters."
 )
 async def strip_sentiment_bias(
-    tenancy_id: str = Field(description="Unique lease UUID"),
-    raw_transcript: Optional[str] = Field(default=None, description="Raw transcript or normalized text"),
-    raw_message_text: Optional[str] = Field(default=None, description="Alias for raw_transcript"),
+    raw_message_text: Optional[str] = Field(default=None, description="Raw transcript or typed text"),
+    raw_transcript: Optional[str] = Field(default=None, description="Alias for raw_message_text"),
+    tenancy_id: Optional[str] = Field(default="TEN-COV-001", description="Unique lease UUID"),
     sender_role: str = Field(default="TENANT", description="TENANT or LANDLORD"),
     evidence_hash: Optional[str] = Field(default="MOCK_HASH_DIGEST", description="Section 63 BSA origin SHA-256 binary hash")
 ) -> str:
-    text = (raw_transcript or raw_message_text or "").strip()
+    text = (raw_message_text or raw_transcript or "").strip()
     lower_text = text.lower()
 
-    # 1. Hostility & Retaliatory Threat Detection (General Pattern Lexicon)
+    # 1. Hostility & Threat Parsing
     threat_patterns = [
         r"not paying rent", r"rent se kaat", r"rent deduct", r"nahi dunga",
         r"withhold.*rent", r"smash", r"maar dunga", r"thief", r"insane",
-        r"useless", r"idiot", r"terrible", r"worst", r"hate living"
+        r"useless", r"idiot", r"terrible", r"worst"
     ]
     threats_found = [p for p in threat_patterns if re.search(p, lower_text)]
     is_hostile = len(threats_found) > 0 or ("!" in text and any(w in lower_text for w in ["insane", "thief", "idiot"]))
 
-    # 2. Dynamic Fixture & Surface Catalog Extraction
+    # 2. Dynamic Fixture Parsing
     fixture_map = {
         "geyser": "BATHROOM_GEYSER",
         "ac": "AIR_CONDITIONER",
@@ -642,16 +646,10 @@ async def strip_sentiment_bias(
         "wall": "PAINT_WALL",
         "painting": "PAINT_WALL"
     }
-    extracted_fixtures = []
-    for keyword, fixture_id in fixture_map.items():
-        if re.search(r"\b" + re.escape(keyword) + r"\b", lower_text):
-            if fixture_id not in extracted_fixtures:
-                extracted_fixtures.append(fixture_id)
-
+    extracted_fixtures = [fid for kw, fid in fixture_map.items() if re.search(r"\b" + re.escape(kw) + r"\b", lower_text)]
     target_fixture = extracted_fixtures[0] if extracted_fixtures else None
 
-    # 3. Dynamic Date & Deadline Extraction
-    # Handles: "6 October 2026", "2026-10-06", "8 October 2026", "09 October 2026", etc.
+    # 3. Dynamic Date & Deadline Parsing
     iso_date_match = re.search(r"\b(\d{4}-\d{2}-\d{2})\b", text)
     written_date_match = re.search(
         r"\b(\d{1,2})\s+(january|february|march|april|may|june|july|august|september|october|november|december)(?:\s+(\d{4}))?\b",
@@ -671,7 +669,7 @@ async def strip_sentiment_bias(
         except Exception:
             agreed_deadline_iso = f"{year}-10-{day}"
 
-    # 4. Dynamic Cost Bearer Allocation
+    # 4. Dynamic Cost Bearer Parsing
     cost_bearer = "UNRESOLVED"
     if re.search(r"\b(landlord will pay|landlord ka kharcha|landlord pay|owner will pay|owner pays|landlord pays)\b", lower_text):
         cost_bearer = "LANDLORD"
@@ -681,10 +679,8 @@ async def strip_sentiment_bias(
         cost_bearer = "SPLIT"
 
     # 5. Covenant Validation Gate (CV4 Compliance)
-    # True ONLY when fixture, deadline, and cost bearer are all unambiguously present
     covenant_extracted = bool(target_fixture and agreed_deadline_iso and cost_bearer != "UNRESOLVED")
 
-    # 6. Objective Neutralization
     action_type = "REPLACE" if any(w in lower_text for w in ["replace", "badal", "naya"]) else "REPAIR"
     fixture_display = (target_fixture or "fixture").replace("_", " ").title()
 
@@ -693,11 +689,11 @@ async def strip_sentiment_bias(
     elif target_fixture:
         neutralized_statement = f"{sender_role.title()} reports {fixture_display} is non-functional and requests repair."
     else:
-        neutralized_statement = f"{sender_role.title()} submitted a general inquiry or unstructured complaint."
+        neutralized_statement = f"{sender_role.title()} submitted an unstructured complaint."
 
     return json.dumps({
         "status": "SENTIMENT_NORMALIZED",
-        "tenancy_id": tenancy_id,
+        "tenancy_id": tenancy_id or "TEN-COV-001",
         "neutralized_statement": neutralized_statement,
         "covenant_extracted": covenant_extracted,
         "action_type": action_type,
@@ -708,7 +704,7 @@ async def strip_sentiment_bias(
         "hostility_score": 0.85 if is_hostile else 0.10,
         "aggression_stripped": is_hostile,
         "threat_flags_stripped": ["RENT_WITHHOLDING_THREAT"] if is_hostile else [],
-        "origin_evidence_hash": evidence_hash
+        "origin_evidence_hash": evidence_hash or "MOCK_HASH_DIGEST"
     })
 
 @mcp.tool(
@@ -716,36 +712,36 @@ async def strip_sentiment_bias(
     description="Compiles an immutable electronic contract addendum under Section 10A of the Information Technology Act, 2000."
 )
 async def generate_it_act_addendum(
-    tenancy_id: str = Field(description="Unique lease UUID"),
-    covenant_json: Any = Field(description="Structured covenant payload string or dictionary"),
-    evidence_hash: str = Field(description="Section 63 BSA origin audio_sha256_hash")
+    tenancy_id: Optional[str] = Field(default="TEN-COV-001", description="Unique lease UUID"),
+    covenant_json: Optional[Any] = Field(default=None, description="Structured covenant payload string or dictionary"),
+    structured_covenant_json: Optional[Any] = Field(default=None, description="Alias for covenant_json"),
+    evidence_hash: Optional[str] = Field(default=None, description="Section 63 BSA origin audio hash"),
+    audio_sha256_hash: Optional[str] = Field(default=None, description="Alias for evidence_hash")
 ) -> str:
-    # Handle stringified JSON or direct dictionary input
-    cov = json.loads(covenant_json) if isinstance(covenant_json, str) else covenant_json
-    if not isinstance(cov, dict):
-        cov = {}
+    cov_payload = covenant_json or structured_covenant_json or {}
+    cov = json.loads(cov_payload) if isinstance(cov_payload, str) else cov_payload
+    hash_val = evidence_hash or audio_sha256_hash or "EVID_HASH_TEXT_ORIGIN"
+    tid = tenancy_id or "TEN-COV-001"
 
     target = cov.get("target_fixture", cov.get("asset_affected", "BATHROOM_GEYSER"))
     deadline = cov.get("agreed_deadline_iso", cov.get("statutory_deadline_hours", "72h"))
     bearer = cov.get("cost_bearer", "LANDLORD")
 
-    addendum_id = f"ADDENDUM_{tenancy_id[:6].upper()}_{hashlib.md5(evidence_hash.encode()).hexdigest()[:6]}"
+    addendum_id = f"ADDENDUM_{tid[:6].upper()}_{hashlib.md5(hash_val.encode()).hexdigest()[:6]}"
     clause_text = f"Addendum: Landlord covenants to execute repair of {target} on or before {deadline}. Cost responsibility assigned to {bearer}."
     hash_digest = hashlib.sha256(clause_text.encode()).hexdigest()
 
     record = {
         "addendum_id": addendum_id,
-        "tenancy_id": tenancy_id,
+        "tenancy_id": tid,
         "contract_clause_markdown": clause_text,
         "legal_binding_basis": "IT_ACT_2000_SEC_10A",
         "requires_dual_confirmation": True,
         "hash_digest": hash_digest,
-        "evidence_anchor_sha256": evidence_hash,
+        "evidence_anchor_sha256": hash_val,
         "status": "DRAFTED_AWAITING_COUNTERSIGN",
         "timestamp_utc": datetime.now(timezone.utc).isoformat()
     }
-    
-    # Commit to shared state
     STATE_STORE.setdefault("covenants", {})[addendum_id] = record
     return json.dumps(record)
 
@@ -754,30 +750,34 @@ async def generate_it_act_addendum(
     description="Dispatches a structured WhatsApp Action Card with a 24-hour Notice of Understanding countdown timer."
 )
 async def dispatch_whatsapp_hsm(
-    tenancy_id: str = Field(description="Unique lease UUID"),
-    recipient_phone: Optional[str] = Field(default=None, description="Landlord phone with country code e.g. +9198XXXXXXXX"),
+    tenancy_id: Optional[str] = Field(default="TEN-COV-001", description="Unique lease UUID"),
+    recipient_phone: Optional[str] = Field(default="+919876543210", description="Recipient phone number"),
     recipient_phone_e164: Optional[str] = Field(default=None, description="Alias for recipient_phone"),
-    template_name: str = Field(default="MAINTENANCE_NOTICE_OF_UNDERSTANDING", description="Template identifier"),
+    template_name: Optional[str] = Field(default="MAINTENANCE_NOTICE_OF_UNDERSTANDING", description="Template identifier"),
     template_type: Optional[str] = Field(default=None, description="Alias for template_name"),
-    template_variables: str = Field(default="{}", description="JSON string of template variables"),
-    passive_consent_hours: int = Field(default=24, description="Timer window in hours"),
-    addendum_id: str = Field(default="ADDENDUM_STAGED", description="Staged addendum UUID")
+    template_variables: Optional[Any] = Field(default="{}", description="JSON string or dict of template variables"),
+    passive_consent_hours: Optional[int] = Field(default=24, description="Timer window in hours"),
+    addendum_id: Optional[str] = Field(default="ADDENDUM_STAGED", description="Staged addendum UUID"),
+    summary_text: Optional[str] = Field(default=None, description="Optional summary text")
 ) -> str:
     target_phone = recipient_phone or recipient_phone_e164 or "+919876543210"
-    active_template = template_type or template_name
+    active_template = template_type or template_name or "MAINTENANCE_NOTICE_OF_UNDERSTANDING"
+    aid = addendum_id or "ADDENDUM_STAGED"
+    tid = tenancy_id or "TEN-COV-001"
     now = datetime.now(timezone.utc)
-    deadline = now + timedelta(hours=passive_consent_hours)
+    deadline = now + timedelta(hours=passive_consent_hours or 24)
 
-return json.dumps({
-    "status": "DISPATCHED_AND_ARMED",
-    "whatsapp_message_id": f"wamid.HBgL{tenancy_id[:6].upper()}_{int(now.timestamp())}",
-    "dispatch_timestamp_utc": now.isoformat(),
-    "passive_timer_id": f"TIMER_24H_{addendum_id}",
-    "timer_expiry_timestamp_utc": deadline.isoformat(),
-    "delivery_status": "DELIVERED",
-    "recipient_phone": target_phone,
-    "addendum_id": addendum_id,
-    "interactive_buttons": ["APPROVE", "DISPUTE"]
-})
+    return json.dumps({
+        "status": "DISPATCHED_AND_ARMED",
+        "whatsapp_message_id": f"wamid.HBgL{tid[:6].upper()}_{int(now.timestamp())}",
+        "dispatch_timestamp_utc": now.isoformat(),
+        "passive_timer_id": f"TIMER_24H_{aid}",
+        "timer_expiry_timestamp_utc": deadline.isoformat(),
+        "delivery_status": "DELIVERED",
+        "recipient_phone": target_phone,
+        "addendum_id": aid,
+        "hsm_template": active_template,
+        "interactive_buttons": ["APPROVE", "DISPUTE"]
+    })
 if __name__ == "__main__":
     mcp.run(transport="sse")
