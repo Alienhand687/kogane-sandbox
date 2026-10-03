@@ -61,6 +61,63 @@ STATIC_FIXTURES: Dict[str, Dict[str, Any]] = {
     }
 }
 
+
+# ============================================================================
+# GRANTEX LEAST-PRIVILEGE SCOPE REGISTRY & MOCK VALIDATOR
+# ============================================================================
+TOOL_GRANTEX_SCOPES: Dict[str, str] = {
+    # Agent 1: Escrow & Capital Tools (Pine Labs)
+    "create_tripartite_vault": "escrow:vault:create",
+    "trigger_treps_sweep": "escrow:repo:invest",
+    "lock_dispute_subvault": "escrow:dispute:lock",
+    "execute_split_payout": "escrow:payout:execute",
+    "invoke_fldg_deduction": "escrow:fldg:deduct",
+    # Agent 2: Condition Arbitration Tools (Delhivery / CPWD / SOR)
+    "dispatch_delhivery_rvp": "condition:rvp:dispatch",
+    "ingest_mesh_baseline": "condition:baseline:ingest",
+    "compute_pointcloud_delta": "condition:delta:compute",
+    "apply_cpwd_depreciation": "condition:cpwd:depreciate",
+    "query_sor_ceiling": "condition:sor:query",
+    # Agent 3: Covenant & Legal Tools (Gnani / WhatsApp)
+    "transcribe_gnani_asr": "covenant:asr:transcribe",
+    "strip_sentiment_bias": "covenant:sentiment:strip",
+    "generate_it_act_addendum": "covenant:addendum:generate",
+    "dispatch_whatsapp_hsm": "covenant:hsm:dispatch",
+    # Platform Audit
+    "append_google_sheet_row": "audit:ledger:append"
+}
+
+def verify_grantex_authorization(tool_name: str, auth_token: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Validates Grantex least-privilege authorization against the required tool scope.
+    In permissive dev mode (auth_token is None/empty), access is granted with a mock audit trail.
+    If auth_token is provided, the required scope or admin scope must be present.
+    """
+    required_scope = TOOL_GRANTEX_SCOPES.get(tool_name, "general:access")
+    if not isinstance(auth_token, str) or not auth_token.strip():
+        return {
+            "authorized": True,
+            "mode": "PERMISSIVE_DEV_MOCK",
+            "scope_checked": required_scope,
+            "status": "PASS"
+        }
+    
+    token_str = auth_token.strip()
+    if required_scope in token_str or "admin:all" in token_str or "grantex:superadmin" in token_str:
+        return {
+            "authorized": True,
+            "mode": "STRICT_TOKEN_VERIFIED",
+            "scope_checked": required_scope,
+            "status": "PASS"
+        }
+    
+    return {
+        "authorized": False,
+        "mode": "TOKEN_REJECTED",
+        "scope_checked": required_scope,
+        "error": f"GRANTEX_ACCESS_DENIED: Token lacks required scope '{required_scope}'"
+    }
+
 # ============================================================================
 # AGENT 1: ESCROW & CAPITAL TOOLS (PINE LABS / RBI ESCROW)
 # ============================================================================
@@ -74,8 +131,12 @@ async def create_tripartite_vault(
     tenant_id: str = Field(description="Tenant UUID or PAN"),
     landlord_id: str = Field(description="Landlord UUID or PAN"),
     deposit_amount_inr: float = Field(description="Total refundable security deposit locked"),
-    tenancy_period_months: int = Field(default=11, description="Lease duration in months")
+    tenancy_period_months: int = Field(default=11, description="Lease duration in months"),
+    grantex_token: Optional[str] = Field(default=None, description="Optional Grantex scoped authorization token")
 ) -> str:
+    auth = verify_grantex_authorization("create_tripartite_vault", grantex_token)
+    if not auth["authorized"]:
+        return json.dumps({"status": "GRANTEX_ACCESS_DENIED", "error": auth["error"], "required_scope": auth["scope_checked"]})
     vault_id = f"VAULT_{tenancy_id.upper()[:8]}_{int(deposit_amount_inr)}"
     record = {
         "vault_id": vault_id,
@@ -101,8 +162,12 @@ async def create_tripartite_vault(
 async def trigger_treps_sweep(
     vault_id: str = Field(description="Tripartite Escrow Vault identifier"),
     sweep_amount_inr: float = Field(description="Float balance to deploy into overnight sovereign repos"),
-    annualized_yield_pct: float = Field(default=6.75, description="Benchmark yield rate")
+    annualized_yield_pct: float = Field(default=6.75, description="Benchmark yield rate"),
+    grantex_token: Optional[str] = Field(default=None, description="Optional Grantex scoped authorization token")
 ) -> str:
+    auth = verify_grantex_authorization("trigger_treps_sweep", grantex_token)
+    if not auth["authorized"]:
+        return json.dumps({"status": "GRANTEX_ACCESS_DENIED", "error": auth["error"], "required_scope": auth["scope_checked"]})
     daily_yield = round(sweep_amount_inr * (annualized_yield_pct / 100.0) / 365.0, 2)
     landlord_share = round(daily_yield * 0.5, 2)
     platform_share = round(daily_yield - landlord_share, 2)
@@ -127,8 +192,12 @@ async def trigger_treps_sweep(
 async def lock_dispute_subvault(
     vault_id: str = Field(description="Tripartite Escrow Vault ID"),
     disputed_amount_inr: float = Field(description="Contested damage delta to be quarantined"),
-    dispute_reason: str = Field(description="Grounds for contestation")
+    dispute_reason: str = Field(description="Grounds for contestation"),
+    grantex_token: Optional[str] = Field(default=None, description="Optional Grantex scoped authorization token")
 ) -> str:
+    auth = verify_grantex_authorization("lock_dispute_subvault", grantex_token)
+    if not auth["authorized"]:
+        return json.dumps({"status": "GRANTEX_ACCESS_DENIED", "error": auth["error"], "required_scope": auth["scope_checked"]})
     vault = STATE_STORE["vaults"].get(vault_id, {
         "undisputed_balance_inr": 150000.0,
         "disputed_subvault_inr": 0.0
@@ -158,8 +227,12 @@ async def execute_split_payout(
     tenant_payout_inr: float = Field(description="Liquid release sanctioned to tenant"),
     landlord_payout_inr: float = Field(description="Approved deduction balance paid to landlord"),
     latent_defect_hold_pct: float = Field(default=15.0, description="Float reserved for 7-day Latent Defect Bond"),
-    t0_qr_nonce: str = Field(description="Cryptographic nonce verified at key-exchange")
+    t0_qr_nonce: str = Field(description="Cryptographic nonce verified at key-exchange"),
+    grantex_token: Optional[str] = Field(default=None, description="Optional Grantex scoped authorization token")
 ) -> str:
+    auth = verify_grantex_authorization("execute_split_payout", grantex_token)
+    if not auth["authorized"]:
+        return json.dumps({"status": "GRANTEX_ACCESS_DENIED", "error": auth["error"], "required_scope": auth["scope_checked"]})
     if not t0_qr_nonce.startswith("NONCE_T0_VALID"):
         return json.dumps({
             "status": "PAYOUT_REJECTED",
@@ -188,8 +261,12 @@ async def invoke_fldg_deduction(
     vault_id: str = Field(description="Tripartite Escrow Vault ID"),
     missed_rent_amount_inr: float = Field(description="Contractual monthly rent due"),
     enach_bounce_code: str = Field(description="NPCI failure code (e.g., 'INSUFFICIENT_FUNDS')"),
-    grace_period_expired: bool = Field(default=True, description="True if 72-hour grace timer elapsed")
+    grace_period_expired: bool = Field(default=True, description="True if 72-hour grace timer elapsed"),
+    grantex_token: Optional[str] = Field(default=None, description="Optional Grantex scoped authorization token")
 ) -> str:
+    auth = verify_grantex_authorization("invoke_fldg_deduction", grantex_token)
+    if not auth["authorized"]:
+        return json.dumps({"status": "GRANTEX_ACCESS_DENIED", "error": auth["error"], "required_scope": auth["scope_checked"]})
     if not grace_period_expired:
         return json.dumps({
             "status": "FLDG_REJECTED",
@@ -217,8 +294,12 @@ async def dispatch_delhivery_rvp(
     pincode: str = Field(description="6-digit Indian Postal PIN code"),
     latitude: float = Field(description="Property latitude"),
     longitude: float = Field(description="Property longitude"),
-    inspection_type: str = Field(default="MOVE_OUT_AUDIT", description="'MOVE_OUT_AUDIT' or 'SUPERVISORY_RESCAN'")
+    inspection_type: str = Field(default="MOVE_OUT_AUDIT", description="'MOVE_OUT_AUDIT' or 'SUPERVISORY_RESCAN'"),
+    grantex_token: Optional[str] = Field(default=None, description="Optional Grantex scoped authorization token")
 ) -> str:
+    auth = verify_grantex_authorization("dispatch_delhivery_rvp", grantex_token)
+    if not auth["authorized"]:
+        return json.dumps({"status": "GRANTEX_ACCESS_DENIED", "error": auth["error"], "required_scope": auth["scope_checked"]})
     if pincode == "000000":
         return json.dumps({"status": "SERVICEABILITY_DEFICIT", "error": "PIN code not serviceable by primary fleet."})
 
@@ -237,8 +318,12 @@ async def dispatch_delhivery_rvp(
 async def ingest_mesh_baseline(
     tenancy_id: str = Field(description="Unique lease UUID"),
     video_stream_s3_uri: str = Field(description="S3 bucket path to video sweep"),
-    imu_spatial_data_s3_uri: str = Field(description="S3 bucket path to IMU sensors")
+    imu_spatial_data_s3_uri: str = Field(description="S3 bucket path to IMU sensors"),
+    grantex_token: Optional[str] = Field(default=None, description="Optional Grantex scoped authorization token")
 ) -> str:
+    auth = verify_grantex_authorization("ingest_mesh_baseline", grantex_token)
+    if not auth["authorized"]:
+        return json.dumps({"status": "GRANTEX_ACCESS_DENIED", "error": auth["error"], "required_scope": auth["scope_checked"]})
     mock_hash = hashlib.sha256(f"{tenancy_id}_baseline_raw".encode()).hexdigest()
     STATE_STORE["inspections"][f"{tenancy_id}_baseline"] = {
         "hash": mock_hash,
@@ -261,8 +346,12 @@ async def compute_pointcloud_delta(
     tenancy_id: str = Field(description="Unique lease UUID or static scenario name"),
     baseline_mesh_id: str = Field(description="Baseline mesh reference ID"),
     exit_mesh_id: str = Field(description="Exit mesh reference ID"),
-    tolerance_threshold_mm: float = Field(default=3.0)
+    tolerance_threshold_mm: float = Field(default=3.0),
+    grantex_token: Optional[str] = Field(default=None, description="Optional Grantex scoped authorization token")
 ) -> str:
+    auth = verify_grantex_authorization("compute_pointcloud_delta", grantex_token)
+    if not auth["authorized"]:
+        return json.dumps({"status": "GRANTEX_ACCESS_DENIED", "error": auth["error"], "required_scope": auth["scope_checked"]})
     fixture = STATIC_FIXTURES.get(tenancy_id, STATIC_FIXTURES["eval_paint_wear"])
 
     if fixture.get("occlusion"):
@@ -288,8 +377,12 @@ async def compute_pointcloud_delta(
 async def apply_cpwd_depreciation(
     tenancy_id: str = Field(description="Unique lease UUID"),
     tenancy_duration_months: int = Field(description="Total months elapsed in tenancy"),
-    raw_anomalies: str = Field(description="JSON array of anomalies or string representation")
+    raw_anomalies: str = Field(description="JSON array of anomalies or string representation"),
+    grantex_token: Optional[str] = Field(default=None, description="Optional Grantex scoped authorization token")
 ) -> str:
+    auth = verify_grantex_authorization("apply_cpwd_depreciation", grantex_token)
+    if not auth["authorized"]:
+        return json.dumps({"status": "GRANTEX_ACCESS_DENIED", "error": auth["error"], "required_scope": auth["scope_checked"]})
     anomalies_list = json.loads(raw_anomalies) if isinstance(raw_anomalies, str) else raw_anomalies
     results = []
 
@@ -328,8 +421,12 @@ async def apply_cpwd_depreciation(
 async def query_sor_ceiling(
     pincode: str = Field(description="6-digit Indian Postal PIN code"),
     trade_category: str = Field(description="Trade: PAINTING, PLUMBING, ELECTRICAL, CARPENTRY, or FLOORING"),
-    repair_item_code: str = Field(description="Standardized repair fixture identifier")
+    repair_item_code: str = Field(description="Standardized repair fixture identifier"),
+    grantex_token: Optional[str] = Field(default=None, description="Optional Grantex scoped authorization token")
 ) -> str:
+    auth = verify_grantex_authorization("query_sor_ceiling", grantex_token)
+    if not auth["authorized"]:
+        return json.dumps({"status": "GRANTEX_ACCESS_DENIED", "error": auth["error"], "required_scope": auth["scope_checked"]})
     rate_table = {
         "PAINTING": {"labor": 1200.0, "material": 1800.0, "total": 3000.0},
         "FLOORING": {"labor": 1500.0, "material": 2500.0, "total": 4000.0},
@@ -356,8 +453,12 @@ async def query_sor_ceiling(
 async def transcribe_gnani_asr(
     tenancy_id: str = Field(description="Unique lease UUID"),
     raw_audio_s3_uri: str = Field(description="S3 bucket URI of recorded audio file"),
-    source_language_hint: str = Field(default="hi-IN", description="Language code: hi-IN, kn-IN, ta-IN, te-IN")
+    source_language_hint: str = Field(default="hi-IN", description="Language code: hi-IN, kn-IN, ta-IN, te-IN"),
+    grantex_token: Optional[str] = Field(default=None, description="Optional Grantex scoped authorization token")
 ) -> str:
+    auth = verify_grantex_authorization("transcribe_gnani_asr", grantex_token)
+    if not auth["authorized"]:
+        return json.dumps({"status": "GRANTEX_ACCESS_DENIED", "error": auth["error"], "required_scope": auth["scope_checked"]})
     mock_audio_hash = hashlib.sha256(raw_audio_s3_uri.encode()).hexdigest()
     
     transcripts = {
@@ -382,8 +483,12 @@ async def transcribe_gnani_asr(
 )
 async def strip_sentiment_bias(
     raw_transcript: str = Field(description="Raw speech-to-text transcript"),
-    evidence_hash: str = Field(description="Section 63 BSA origin SHA-256 binary hash")
+    evidence_hash: str = Field(description="Section 63 BSA origin SHA-256 binary hash"),
+    grantex_token: Optional[str] = Field(default=None, description="Optional Grantex scoped authorization token")
 ) -> str:
+    auth = verify_grantex_authorization("strip_sentiment_bias", grantex_token)
+    if not auth["authorized"]:
+        return json.dumps({"status": "GRANTEX_ACCESS_DENIED", "error": auth["error"], "required_scope": auth["scope_checked"]})
     return json.dumps({
         "status": "SENTIMENT_NORMALIZED",
         "hostility_detected": True,
@@ -404,8 +509,12 @@ async def strip_sentiment_bias(
 async def generate_it_act_addendum(
     tenancy_id: str = Field(description="Unique lease UUID"),
     covenant_json: str = Field(description="Structured covenant payload string"),
-    evidence_hash: str = Field(description="Section 63 BSA origin hash")
+    evidence_hash: str = Field(description="Section 63 BSA origin hash"),
+    grantex_token: Optional[str] = Field(default=None, description="Optional Grantex scoped authorization token")
 ) -> str:
+    auth = verify_grantex_authorization("generate_it_act_addendum", grantex_token)
+    if not auth["authorized"]:
+        return json.dumps({"status": "GRANTEX_ACCESS_DENIED", "error": auth["error"], "required_scope": auth["scope_checked"]})
     cov = json.loads(covenant_json) if isinstance(covenant_json, str) else covenant_json
     addendum_id = f"ADDENDUM_{tenancy_id[:6].upper()}_{hashlib.md5(evidence_hash.encode()).hexdigest()[:6]}"
     
@@ -429,8 +538,12 @@ async def dispatch_whatsapp_hsm(
     tenancy_id: str = Field(description="Unique lease UUID"),
     counterparty_phone: str = Field(description="E.164 phone number (+91...)"),
     addendum_id: str = Field(description="Staged Addendum UUID"),
-    template_type: str = Field(default="NOTICE_OF_UNDERSTANDING_MAINTENANCE")
+    template_type: str = Field(default="NOTICE_OF_UNDERSTANDING_MAINTENANCE"),
+    grantex_token: Optional[str] = Field(default=None, description="Optional Grantex scoped authorization token")
 ) -> str:
+    auth = verify_grantex_authorization("dispatch_whatsapp_hsm", grantex_token)
+    if not auth["authorized"]:
+        return json.dumps({"status": "GRANTEX_ACCESS_DENIED", "error": auth["error"], "required_scope": auth["scope_checked"]})
     now = datetime.now(timezone.utc)
     deadline = now + timedelta(hours=24)
 
@@ -460,8 +573,12 @@ async def append_google_sheet_row(
     tool_called: str = Field(default="NONE", description="Name of the tool executed, or NONE"),
     idempotency_key: str = Field(default="NONE", description="Idempotency key of the action"),
     result: str = Field(default="SUCCESS", description="Outcome description or status code"),
-    state_after: str = Field(default="SAME", description="State machine status after transition")
+    state_after: str = Field(default="SAME", description="State machine status after transition"),
+    grantex_token: Optional[str] = Field(default=None, description="Optional Grantex scoped authorization token")
 ) -> str:
+    auth = verify_grantex_authorization("append_google_sheet_row", grantex_token)
+    if not auth["authorized"]:
+        return json.dumps({"status": "GRANTEX_ACCESS_DENIED", "error": auth["error"], "required_scope": auth["scope_checked"]})
     audit_row = {
         "timestamp_utc": datetime.now(timezone.utc).isoformat(),
         "tenancy_id": tenancy_id,
