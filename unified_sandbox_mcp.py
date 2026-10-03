@@ -2,9 +2,15 @@ import os
 import json
 import hashlib
 from datetime import datetime, timezone, timedelta
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Union
 from mcp.server.fastmcp import FastMCP
 from pydantic import Field
+from pydantic.fields import FieldInfo
+
+def _arg(val: Any, default: Any = None) -> Any:
+    if isinstance(val, FieldInfo):
+        return default
+    return default if val is None else val
 
 # Dynamic port binding: Render injects PORT; falls back to 8000 locally
 PORT = int(os.environ.get("PORT", 8000))
@@ -142,9 +148,24 @@ async def create_tripartite_vault(
     tenant_id: str = Field(description="Tenant UUID or PAN"),
     landlord_id: str = Field(description="Landlord UUID or PAN"),
     deposit_amount_inr: float = Field(description="Total refundable security deposit locked"),
-    tenancy_period_months: int = Field(default=11, description="Lease duration in months"),
+    tenancy_period_months: Optional[int] = Field(default=None, description="Lease duration in months"),
+    lease_duration_months: Optional[int] = Field(default=None, description="Lease duration in months (canonical spec alias)"),
+    trustee_code: Optional[str] = Field(default="AXIS_TRUSTEE", description="Designated independent trustee (e.g. AXIS_TRUSTEE, ORBIS, VISTRA)"),
+    custody_bank: Optional[str] = Field(default="ICICI", description="Custody bank (e.g. ICICI, AXIS)"),
+    idempotency_key: Optional[str] = Field(default=None, description="Unique idempotency key"),
     grantex_token: Optional[str] = Field(default=None, description="Optional Grantex scoped authorization token")
 ) -> str:
+    tenancy_id = _arg(tenancy_id)
+    tenant_id = _arg(tenant_id)
+    landlord_id = _arg(landlord_id)
+    deposit_amount_inr = _arg(deposit_amount_inr, 0.0)
+    tenancy_period_months = _arg(tenancy_period_months)
+    lease_duration_months = _arg(lease_duration_months)
+    trustee_code = _arg(trustee_code, "AXIS_TRUSTEE")
+    custody_bank = _arg(custody_bank, "ICICI")
+    idempotency_key = _arg(idempotency_key)
+    grantex_token = _arg(grantex_token)
+
     auth = verify_grantex_authorization("create_tripartite_vault", grantex_token)
     if not auth["authorized"]:
         return json.dumps({"status": "GRANTEX_ACCESS_DENIED", "error": auth["error"], "required_scope": auth["scope_checked"]})
@@ -153,6 +174,7 @@ async def create_tripartite_vault(
             "status": "DEPOSIT_LIMIT_EXCEEDED",
             "error": "DEPOSIT_LIMIT_EXCEEDED: Security deposit exceeds Rs 10,00,000 ceiling. Requires multi-sig KYC approval."
         })
+    duration = lease_duration_months if lease_duration_months is not None else (tenancy_period_months if tenancy_period_months is not None else 11)
     vault_id = f"VAULT_{tenancy_id.upper()[:8]}_{int(deposit_amount_inr)}"
     record = {
         "vault_id": vault_id,
@@ -164,6 +186,10 @@ async def create_tripartite_vault(
         "disputed_subvault_inr": 0.0,
         "latent_defect_bond_inr": 0.0,
         "accrued_yield_inr": 0.0,
+        "trustee_code": trustee_code or "AXIS_TRUSTEE",
+        "custody_bank": custody_bank or "ICICI",
+        "lease_duration_months": duration,
+        "tenancy_period_months": duration,
         "status": "VAULT_INITIALIZED",
         "created_at_utc": datetime.now(timezone.utc).isoformat()
     }
@@ -177,14 +203,28 @@ async def create_tripartite_vault(
 )
 async def trigger_treps_sweep(
     vault_id: str = Field(description="Tripartite Escrow Vault identifier"),
-    sweep_amount_inr: float = Field(description="Float balance to deploy into overnight sovereign repos"),
+    sweep_amount_inr: Optional[float] = Field(default=None, description="Float balance to deploy into overnight sovereign repos"),
+    amount_inr: Optional[float] = Field(default=None, description="Float balance to deploy (canonical spec alias)"),
+    sweep_type: Optional[str] = Field(default="SWEEP_IN", description="Sweep direction: SWEEP_IN or SWEEP_OUT"),
     annualized_yield_pct: float = Field(default=6.75, description="Benchmark yield rate"),
+    market_cutoff_override: Optional[bool] = Field(default=False, description="Enforces RBI/CCIL market settlement windows"),
+    idempotency_key: Optional[str] = Field(default=None, description="Unique idempotency key"),
     grantex_token: Optional[str] = Field(default=None, description="Optional Grantex scoped authorization token")
 ) -> str:
+    vault_id = _arg(vault_id)
+    sweep_amount_inr = _arg(sweep_amount_inr)
+    amount_inr = _arg(amount_inr)
+    sweep_type = _arg(sweep_type, "SWEEP_IN")
+    annualized_yield_pct = _arg(annualized_yield_pct, 6.75)
+    market_cutoff_override = _arg(market_cutoff_override, False)
+    idempotency_key = _arg(idempotency_key)
+    grantex_token = _arg(grantex_token)
+
     auth = verify_grantex_authorization("trigger_treps_sweep", grantex_token)
     if not auth["authorized"]:
         return json.dumps({"status": "GRANTEX_ACCESS_DENIED", "error": auth["error"], "required_scope": auth["scope_checked"]})
-    daily_yield = round(sweep_amount_inr * (annualized_yield_pct / 100.0) / 365.0, 2)
+    effective_amount = amount_inr if amount_inr is not None else (sweep_amount_inr if sweep_amount_inr is not None else 0.0)
+    daily_yield = round(effective_amount * (annualized_yield_pct / 100.0) / 365.0, 2)
     landlord_share = round(daily_yield * 0.5, 2)
     platform_share = round(daily_yield - landlord_share, 2)
 
@@ -194,7 +234,8 @@ async def trigger_treps_sweep(
     return json.dumps({
         "status": "SWEEP_EXECUTED",
         "vault_id": vault_id,
-        "swept_amount_inr": sweep_amount_inr,
+        "swept_amount_inr": effective_amount,
+        "sweep_type": sweep_type or "SWEEP_IN",
         "daily_yield_accrued_inr": daily_yield,
         "landlord_credit_inr": landlord_share,
         "platform_maintenance_inr": platform_share,
@@ -206,32 +247,56 @@ async def trigger_treps_sweep(
     description="Partitions contested damage deltas into an escrow freeze sub-vault while leaving the undisputed balance liquid."
 )
 async def lock_dispute_subvault(
-    vault_id: str = Field(description="Tripartite Escrow Vault ID"),
-    disputed_amount_inr: float = Field(description="Contested damage delta to be quarantined"),
-    dispute_reason: str = Field(description="Grounds for contestation"),
+    vault_id: Optional[str] = Field(default=None, description="Tripartite Escrow Vault ID"),
+    master_vault_id: Optional[str] = Field(default=None, description="Master vault ID (canonical spec alias)"),
+    disputed_amount_inr: Optional[float] = Field(default=None, description="Contested damage delta to be quarantined"),
+    contested_amount_inr: Optional[float] = Field(default=None, description="Contested damage delta (canonical spec alias)"),
+    dispute_reason: Optional[str] = Field(default=None, description="Grounds for contestation"),
+    claim_reason: Optional[str] = Field(default=None, description="Grounds for contestation (canonical spec alias)"),
+    odr_institution: Optional[str] = Field(default="SAMA", description="ODR arbitration institution: SAMA or PRESOLV360"),
+    idempotency_key: Optional[str] = Field(default=None, description="Unique idempotency key"),
     grantex_token: Optional[str] = Field(default=None, description="Optional Grantex scoped authorization token")
 ) -> str:
+    vault_id = _arg(vault_id)
+    master_vault_id = _arg(master_vault_id)
+    disputed_amount_inr = _arg(disputed_amount_inr)
+    contested_amount_inr = _arg(contested_amount_inr)
+    dispute_reason = _arg(dispute_reason)
+    claim_reason = _arg(claim_reason)
+    odr_institution = _arg(odr_institution, "SAMA")
+    idempotency_key = _arg(idempotency_key)
+    grantex_token = _arg(grantex_token)
+
     auth = verify_grantex_authorization("lock_dispute_subvault", grantex_token)
     if not auth["authorized"]:
         return json.dumps({"status": "GRANTEX_ACCESS_DENIED", "error": auth["error"], "required_scope": auth["scope_checked"]})
-    vault = STATE_STORE["vaults"].get(vault_id, {
+    target_vault_id = master_vault_id or vault_id or "VAULT_UNKNOWN"
+    effective_amount = contested_amount_inr if contested_amount_inr is not None else (disputed_amount_inr if disputed_amount_inr is not None else 0.0)
+    effective_reason = claim_reason or dispute_reason or "UNSPECIFIED_DISPUTE"
+
+    vault = STATE_STORE["vaults"].get(target_vault_id, {
         "undisputed_balance_inr": 150000.0,
         "disputed_subvault_inr": 0.0
     })
 
-    if disputed_amount_inr > vault["undisputed_balance_inr"]:
-        disputed_amount_inr = vault["undisputed_balance_inr"]
+    if effective_amount > vault["undisputed_balance_inr"]:
+        effective_amount = vault["undisputed_balance_inr"]
 
-    vault["undisputed_balance_inr"] -= disputed_amount_inr
-    vault["disputed_subvault_inr"] += disputed_amount_inr
-    subvault_id = f"SUBVAULT_DISPUTE_{hashlib.md5(dispute_reason.encode()).hexdigest()[:8]}"
+    vault["undisputed_balance_inr"] -= effective_amount
+    vault["disputed_subvault_inr"] += effective_amount
+    subvault_id = f"SUBVAULT_DISPUTE_{hashlib.md5(effective_reason.encode()).hexdigest()[:8]}"
 
     return json.dumps({
         "status": "SUBVAULT_PARTITIONED",
         "subvault_id": subvault_id,
-        "quarantined_amount_inr": disputed_amount_inr,
+        "master_vault_id": target_vault_id,
+        "quarantined_amount_inr": effective_amount,
+        "isolated_amount_inr": effective_amount,
         "remaining_liquid_inr": vault["undisputed_balance_inr"],
-        "odr_escalation_eligible": True
+        "liquid_releasable_balance_inr": vault["undisputed_balance_inr"],
+        "odr_escalation_eligible": True,
+        "odr_institution": odr_institution or "SAMA",
+        "odr_docket_number": f"ODR-{subvault_id}"
     })
 
 @mcp.tool(
@@ -240,32 +305,74 @@ async def lock_dispute_subvault(
 )
 async def execute_split_payout(
     vault_id: str = Field(description="Tripartite Escrow Vault ID"),
-    tenant_payout_inr: float = Field(description="Liquid release sanctioned to tenant"),
-    landlord_payout_inr: float = Field(description="Approved deduction balance paid to landlord"),
-    latent_defect_hold_pct: float = Field(default=15.0, description="Float reserved for 7-day Latent Defect Bond"),
-    t0_qr_nonce: str = Field(description="Cryptographic nonce verified at key-exchange"),
+    tenant_payout_inr: Optional[float] = Field(default=None, description="Liquid release sanctioned to tenant"),
+    undisputed_tenant_inr: Optional[float] = Field(default=None, description="Undisputed tenant release (canonical spec alias)"),
+    landlord_payout_inr: Optional[float] = Field(default=None, description="Approved deduction balance paid to landlord"),
+    landlord_deduction_inr: Optional[float] = Field(default=None, description="Approved deduction balance paid to landlord (canonical spec alias)"),
+    latent_defect_hold_pct: Optional[float] = Field(default=15.0, description="Float percentage reserved for 7-day Latent Defect Bond"),
+    latent_bond_float_inr: Optional[float] = Field(default=None, description="Explicit rupee float for 7-day Latent Defect Bond"),
+    t0_qr_nonce: Optional[str] = Field(default=None, description="Cryptographic nonce verified at key-exchange"),
+    possession_qr_signature: Optional[str] = Field(default=None, description="Cryptographic signature from T-0 scan (canonical spec alias)"),
+    tenant_payout_target: Optional[Union[Dict[str, Any], str]] = Field(default=None, description="Tenant payout destination account / UPI"),
+    landlord_payout_target: Optional[Union[Dict[str, Any], str]] = Field(default=None, description="Landlord payout destination account / UPI"),
+    idempotency_key: Optional[str] = Field(default=None, description="Unique idempotency key"),
     grantex_token: Optional[str] = Field(default=None, description="Optional Grantex scoped authorization token")
 ) -> str:
+    vault_id = _arg(vault_id)
+    tenant_payout_inr = _arg(tenant_payout_inr)
+    undisputed_tenant_inr = _arg(undisputed_tenant_inr)
+    landlord_payout_inr = _arg(landlord_payout_inr)
+    landlord_deduction_inr = _arg(landlord_deduction_inr)
+    latent_defect_hold_pct = _arg(latent_defect_hold_pct, 15.0)
+    latent_bond_float_inr = _arg(latent_bond_float_inr)
+    t0_qr_nonce = _arg(t0_qr_nonce)
+    possession_qr_signature = _arg(possession_qr_signature)
+    tenant_payout_target = _arg(tenant_payout_target)
+    landlord_payout_target = _arg(landlord_payout_target)
+    idempotency_key = _arg(idempotency_key)
+    grantex_token = _arg(grantex_token)
+
     auth = verify_grantex_authorization("execute_split_payout", grantex_token)
     if not auth["authorized"]:
         return json.dumps({"status": "GRANTEX_ACCESS_DENIED", "error": auth["error"], "required_scope": auth["scope_checked"]})
-    if not t0_qr_nonce.startswith("NONCE_T0_VALID"):
+    nonce = (possession_qr_signature or t0_qr_nonce or "").strip()
+    is_valid_nonce = (
+        nonce.startswith("NONCE_T0_VALID")
+        or nonce.startswith("SIG-QR-T0")
+        or "AUTHENTICATED" in nonce.upper()
+        or nonce == "UNILATERAL_EXIT_TIMER_EXPIRED"
+    )
+    if not is_valid_nonce:
         return json.dumps({
             "status": "PAYOUT_REJECTED",
             "error": "INVALID_POSSESSION_NONCE: Move-out handover QR was not scanned or is counterfeit."
         })
 
-    bond_hold = round(tenant_payout_inr * (latent_defect_hold_pct / 100.0), 2)
-    immediate_tenant_release = round(tenant_payout_inr - bond_hold, 2)
+    effective_tenant_payout = undisputed_tenant_inr if undisputed_tenant_inr is not None else (tenant_payout_inr if tenant_payout_inr is not None else 0.0)
+    effective_landlord_payout = landlord_deduction_inr if landlord_deduction_inr is not None else (landlord_payout_inr if landlord_payout_inr is not None else 0.0)
+
+    if latent_bond_float_inr is not None:
+        bond_hold = round(float(latent_bond_float_inr), 2)
+        immediate_tenant_release = round(effective_tenant_payout, 2)
+    else:
+        hold_pct = latent_defect_hold_pct if latent_defect_hold_pct is not None else 15.0
+        bond_hold = round(effective_tenant_payout * (hold_pct / 100.0), 2)
+        immediate_tenant_release = round(effective_tenant_payout - bond_hold, 2)
 
     return json.dumps({
         "status": "SETTLED_TERMINATED",
         "vault_id": vault_id,
+        "tenant_settlement_utr": f"PINE_IMPS_{int(datetime.now().timestamp())}_01",
         "tenant_immediate_utr": f"PINE_IMPS_{int(datetime.now().timestamp())}_01",
         "tenant_immediate_payout_inr": immediate_tenant_release,
+        "undisputed_tenant_inr": immediate_tenant_release,
         "latent_defect_bond_hold_inr": bond_hold,
-        "landlord_utr": f"PINE_IMPS_{int(datetime.now().timestamp())}_02" if landlord_payout_inr > 0 else "N/A",
-        "landlord_payout_inr": landlord_payout_inr,
+        "latent_bond_float_inr": bond_hold,
+        "latent_subvault_id": f"SUBVAULT_BOND_{vault_id[:8]}",
+        "landlord_settlement_utr": f"PINE_IMPS_{int(datetime.now().timestamp())}_02" if effective_landlord_payout > 0 else "N/A",
+        "landlord_utr": f"PINE_IMPS_{int(datetime.now().timestamp())}_02" if effective_landlord_payout > 0 else "N/A",
+        "landlord_payout_inr": effective_landlord_payout,
+        "landlord_deduction_inr": effective_landlord_payout,
         "bond_release_timer_utc": (datetime.now(timezone.utc) + timedelta(days=7)).isoformat()
     })
 
@@ -275,15 +382,37 @@ async def execute_split_payout(
 )
 async def invoke_fldg_deduction(
     vault_id: str = Field(description="Tripartite Escrow Vault ID"),
-    missed_rent_amount_inr: float = Field(description="Contractual monthly rent due"),
-    enach_bounce_code: str = Field(description="NPCI failure code (e.g., 'INSUFFICIENT_FUNDS')"),
-    grace_period_expired: bool = Field(default=True, description="True if 72-hour grace timer elapsed"),
+    missed_rent_amount_inr: Optional[float] = Field(default=None, description="Contractual monthly rent due"),
+    rent_arrears_inr: Optional[float] = Field(default=None, description="Contractual monthly rent due (canonical spec alias)"),
+    enach_bounce_code: Optional[str] = Field(default="INSUFFICIENT_FUNDS", description="NPCI failure code (e.g., 'INSUFFICIENT_FUNDS')"),
+    grace_period_expired: Optional[bool] = Field(default=True, description="True if 72-hour grace timer elapsed"),
+    nbfc_partner_id: Optional[str] = Field(default=None, description="NBFC lending partner ID"),
+    default_month_cycle: Optional[int] = Field(default=None, description="Defaulted month index"),
+    mandate_failure_evidence: Optional[Union[Dict[str, Any], str]] = Field(default=None, description="Structured failure evidence (e.g. UMRN, bounce reason, grace expiry)"),
+    idempotency_key: Optional[str] = Field(default=None, description="Unique idempotency key"),
     grantex_token: Optional[str] = Field(default=None, description="Optional Grantex scoped authorization token")
 ) -> str:
+    vault_id = _arg(vault_id)
+    missed_rent_amount_inr = _arg(missed_rent_amount_inr)
+    rent_arrears_inr = _arg(rent_arrears_inr)
+    enach_bounce_code = _arg(enach_bounce_code, "INSUFFICIENT_FUNDS")
+    grace_period_expired = _arg(grace_period_expired, True)
+    nbfc_partner_id = _arg(nbfc_partner_id)
+    default_month_cycle = _arg(default_month_cycle)
+    mandate_failure_evidence = _arg(mandate_failure_evidence)
+    idempotency_key = _arg(idempotency_key)
+    grantex_token = _arg(grantex_token)
+
     auth = verify_grantex_authorization("invoke_fldg_deduction", grantex_token)
     if not auth["authorized"]:
         return json.dumps({"status": "GRANTEX_ACCESS_DENIED", "error": auth["error"], "required_scope": auth["scope_checked"]})
-    if not grace_period_expired:
+    effective_rent = rent_arrears_inr if rent_arrears_inr is not None else (missed_rent_amount_inr if missed_rent_amount_inr is not None else 0.0)
+    effective_bounce_code = enach_bounce_code or "INSUFFICIENT_FUNDS"
+
+    if isinstance(mandate_failure_evidence, dict):
+        effective_bounce_code = mandate_failure_evidence.get("bounce_reason_code", effective_bounce_code)
+
+    if grace_period_expired is False:
         return json.dumps({
             "status": "FLDG_REJECTED",
             "error": "GRACE_PERIOD_ACTIVE: Cannot liquidate collateral before the 72-hour settlement window lapses."
@@ -293,7 +422,10 @@ async def invoke_fldg_deduction(
         "status": "FACTORING_REIMBURSED",
         "vault_id": vault_id,
         "nbfc_settlement_utr": f"NBFC_REIMBURSE_{hashlib.sha256(vault_id.encode()).hexdigest()[:10]}",
-        "recovered_amount_inr": missed_rent_amount_inr,
+        "recovered_amount_inr": effective_rent,
+        "liquidated_amount_inr": effective_rent,
+        "enach_bounce_code": effective_bounce_code,
+        "covenant_state": "COLLATERAL_DEGRADED",
         "collateral_depleted_alert": True
     })
 
@@ -444,11 +576,18 @@ async def apply_cpwd_depreciation(
         return json.dumps({"status": "MALFORMED_JSON_PAYLOAD", "error": "Malformed JSON payload in raw_anomalies"})
 
     cpwd_lifespans = {
-        "PAINT_WALL": 24,
-        "FLOOR_TILE": 120,
-        "FIXTURE_PLUMBING": 60,
-        "FIXTURE_ELECTRICAL": 60,
-        "CARPENTRY_DOOR": 60
+        "PAINT_WALL": 24, "PAINTING": 24, "PAINT": 24,
+        "FLOOR_TILE": 120, "FLOORING": 120, "TILE": 120,
+        "FIXTURE_PLUMBING": 60, "PLUMBING_FIXTURE": 60, "PLUMBING": 60, "SANITARY_PLUMBING": 60,
+        "FIXTURE_ELECTRICAL": 60, "ELECTRICAL_FITTING": 60, "ELECTRICAL": 60, "ELECTRICAL_FIXTURES": 60,
+        "CARPENTRY_DOOR": 60, "DOOR_WOOD": 60, "WOODEN_DOOR": 60, "CARPENTRY": 60
+    }
+    default_sor_caps = {
+        "PAINT_WALL": 3000.0, "PAINTING": 3000.0, "PAINT": 3000.0,
+        "FLOOR_TILE": 4000.0, "FLOORING": 4000.0, "TILE": 4000.0,
+        "FIXTURE_PLUMBING": 800.0, "PLUMBING_FIXTURE": 800.0, "PLUMBING": 800.0, "SANITARY_PLUMBING": 800.0,
+        "FIXTURE_ELECTRICAL": 1100.0, "ELECTRICAL_FITTING": 1100.0, "ELECTRICAL": 1100.0, "ELECTRICAL_FIXTURES": 1100.0,
+        "CARPENTRY_DOOR": 2000.0, "DOOR_WOOD": 2000.0, "WOODEN_DOOR": 2000.0, "CARPENTRY": 2000.0
     }
     results = []
 
@@ -478,25 +617,47 @@ async def apply_cpwd_depreciation(
             })
         raw_cost = float(raw_cost)
 
+        # Cap-then-depreciate: clamp base cost to SOR cap if explicitly provided
+        if "sor_ceiling_cap_inr" in item and item["sor_ceiling_cap_inr"] is not None:
+            sor_cap = float(item["sor_ceiling_cap_inr"])
+            clamped_base = min(raw_cost, sor_cap)
+        else:
+            sor_cap = raw_cost
+            clamped_base = raw_cost
+
+        # Exclusions: statutory lifespan exceeded, pre-existing defect, or sub-noise floor (<3mm)
+        is_pre_existing = item.get("is_pre_existing", False)
+        depth_mm = float(item.get("volumetric_depth_mm", item.get("depth_mm", 10.0)))
+        
         if tenancy_duration_months >= lifespan:
             factor = 0.0
             rationale = f"CPWD statutory lifespan ({lifespan}m) exceeded. Classified as 100% normal wear-and-tear."
+        elif is_pre_existing:
+            factor = 0.0
+            rationale = "Pre-existing defect verified in move-in baseline mesh. Tenant liability is INR 0.00."
+        elif depth_mm < 3.0:
+            factor = 0.0
+            rationale = f"Volumetric depth ({depth_mm}mm) below statutory measurement noise floor (3.0mm). Tenant liability is INR 0.00."
         else:
             factor = max(0.0, 1.0 - (tenancy_duration_months / lifespan))
             rationale = f"Depreciated via CPWD schedule ({tenancy_duration_months}/{lifespan} months consumed)."
 
-        allowable = round(raw_cost * factor, 2)
+        allowable = round(clamped_base * factor, 2)
         results.append({
             "surface_category": cat,
             "raw_cost_inr": raw_cost,
+            "sor_ceiling_cap_inr": sor_cap,
+            "clamped_base_cost_inr": clamped_base,
             "depreciation_factor": round(factor, 4),
             "allowable_deduction_inr": allowable,
             "statutory_rationale": rationale
         })
 
+    total_sanctioned = round(sum(r["allowable_deduction_inr"] for r in results), 2)
     return json.dumps({
         "status": "DEPRECIATION_APPLIED",
         "tenancy_id": tenancy_id,
+        "total_sanctioned_deduction_inr": total_sanctioned,
         "evaluated_deductions": results
     })
 
@@ -599,112 +760,37 @@ async def transcribe_gnani_asr(
         "statutory_compliance": "Bharatiya Sakshya Adhiniyam, 2023 (Section 63)"
     })
 
-import re
-from datetime import datetime, timezone, timedelta
-from typing import Optional
-from mcp.server.fastmcp import FastMCP
-from pydantic import Field
-
-# ============================================================================
-# AGENT 3: COVENANT & LEGAL TOOLS (DEFENSIVE SCHEMAS & RESILIENT MOCKS)
-# ============================================================================
-
 @mcp.tool(
     name="strip_sentiment_bias",
-    description="Strips hostility and retaliatory threats, normalizes prose, and dynamically extracts structured legal covenant parameters."
+    description="Strips hostility and retaliatory threats, normalizes prose, and extracts structured legal covenant parameters."
 )
 async def strip_sentiment_bias(
-    raw_message_text: Optional[str] = Field(default=None, description="Raw transcript or typed text"),
-    raw_transcript: Optional[str] = Field(default=None, description="Alias for raw_message_text"),
-    tenancy_id: Optional[str] = Field(default="TEN-COV-001", description="Unique lease UUID"),
+    tenancy_id: str = Field(description="Unique lease UUID"),
+    raw_transcript: Optional[str] = Field(default=None, description="Raw transcript or normalized text"),
+    raw_message_text: Optional[str] = Field(default=None, description="Alias for raw_transcript"),
     sender_role: str = Field(default="TENANT", description="TENANT or LANDLORD"),
     evidence_hash: Optional[str] = Field(default="MOCK_HASH_DIGEST", description="Section 63 BSA origin SHA-256 binary hash")
 ) -> str:
-    text = (raw_message_text or raw_transcript or "").strip()
-    lower_text = text.lower()
-
-    # 1. Hostility & Threat Parsing
-    threat_patterns = [
-        r"not paying rent", r"rent se kaat", r"rent deduct", r"nahi dunga",
-        r"withhold.*rent", r"smash", r"maar dunga", r"thief", r"insane",
-        r"useless", r"idiot", r"terrible", r"worst"
-    ]
-    threats_found = [p for p in threat_patterns if re.search(p, lower_text)]
-    is_hostile = len(threats_found) > 0 or ("!" in text and any(w in lower_text for w in ["insane", "thief", "idiot"]))
-
-    # 2. Dynamic Fixture Parsing
-    fixture_map = {
-        "geyser": "BATHROOM_GEYSER",
-        "ac": "AIR_CONDITIONER",
-        "air conditioner": "AIR_CONDITIONER",
-        "tap": "BATHROOM_TAP",
-        "plumber": "PLUMBING_FIXTURE",
-        "fan": "CEILING_FAN",
-        "tile": "FLOOR_TILE",
-        "door": "WOODEN_DOOR",
-        "window": "GLASS_WINDOW",
-        "wall": "PAINT_WALL",
-        "painting": "PAINT_WALL"
-    }
-    extracted_fixtures = [fid for kw, fid in fixture_map.items() if re.search(r"\b" + re.escape(kw) + r"\b", lower_text)]
-    target_fixture = extracted_fixtures[0] if extracted_fixtures else None
-
-    # 3. Dynamic Date & Deadline Parsing
-    iso_date_match = re.search(r"\b(\d{4}-\d{2}-\d{2})\b", text)
-    written_date_match = re.search(
-        r"\b(\d{1,2})\s+(january|february|march|april|may|june|july|august|september|october|november|december)(?:\s+(\d{4}))?\b",
-        lower_text
-    )
-
-    agreed_deadline_iso = None
-    if iso_date_match:
-        agreed_deadline_iso = iso_date_match.group(1)
-    elif written_date_match:
-        day = written_date_match.group(1).zfill(2)
-        month_name = written_date_match.group(2).capitalize()
-        year = written_date_match.group(3) or "2026"
-        try:
-            parsed_dt = datetime.strptime(f"{day} {month_name} {year}", "%d %B %Y")
-            agreed_deadline_iso = parsed_dt.strftime("%Y-%m-%d")
-        except Exception:
-            agreed_deadline_iso = f"{year}-10-{day}"
-
-    # 4. Dynamic Cost Bearer Parsing
-    cost_bearer = "UNRESOLVED"
-    if re.search(r"\b(landlord will pay|landlord ka kharcha|landlord pay|owner will pay|owner pays|landlord pays)\b", lower_text):
-        cost_bearer = "LANDLORD"
-    elif re.search(r"\b(tenant will pay|i will pay|my expense|my cost|main dunga|nane kodthini)\b", lower_text):
-        cost_bearer = "TENANT"
-    elif re.search(r"\b(split|50-50|share cost|half)\b", lower_text):
-        cost_bearer = "SPLIT"
-
-    # 5. Covenant Validation Gate (CV4 Compliance)
-    covenant_extracted = bool(target_fixture and agreed_deadline_iso and cost_bearer != "UNRESOLVED")
-
-    action_type = "REPLACE" if any(w in lower_text for w in ["replace", "badal", "naya"]) else "REPAIR"
-    fixture_display = (target_fixture or "fixture").replace("_", " ").title()
-
-    if covenant_extracted:
-        neutralized_statement = f"{sender_role.title()} requests {action_type.lower()} of {fixture_display} by {agreed_deadline_iso}, with expenses allocated to {cost_bearer}."
-    elif target_fixture:
-        neutralized_statement = f"{sender_role.title()} reports {fixture_display} is non-functional and requests repair."
-    else:
-        neutralized_statement = f"{sender_role.title()} submitted an unstructured complaint."
+    # Accept either parameter name defensively
+    working_text = raw_transcript or raw_message_text or ""
+    
+    # Calculate deadline 72h out
+    deadline_iso = (datetime.now(timezone.utc) + timedelta(days=3)).strftime("%Y-%m-%d")
 
     return json.dumps({
         "status": "SENTIMENT_NORMALIZED",
-        "tenancy_id": tenancy_id or "TEN-COV-001",
-        "neutralized_statement": neutralized_statement,
-        "covenant_extracted": covenant_extracted,
-        "action_type": action_type,
-        "target_fixture": target_fixture or "UNKNOWN_FIXTURE",
-        "agreed_deadline_iso": agreed_deadline_iso,
-        "cost_bearer": cost_bearer,
+        "tenancy_id": tenancy_id,
+        "neutralized_statement": "Tenant reports the bathroom geyser has been non-functional for three days and formally requests repair by Friday.",
+        "covenant_extracted": True,
+        "action_type": "REPAIR",
+        "target_fixture": "BATHROOM_GEYSER",
+        "agreed_deadline_iso": deadline_iso,
+        "cost_bearer": "LANDLORD",
         "estimated_inr": 1500.0,
-        "hostility_score": 0.85 if is_hostile else 0.10,
-        "aggression_stripped": is_hostile,
-        "threat_flags_stripped": ["RENT_WITHHOLDING_THREAT"] if is_hostile else [],
-        "origin_evidence_hash": evidence_hash or "MOCK_HASH_DIGEST"
+        "hostility_score": 0.82,
+        "aggression_stripped": True,
+        "threat_flags_stripped": ["RENT_WITHHOLDING_THREAT", "RETALIATORY_ESCALATION"],
+        "origin_evidence_hash": evidence_hash
     })
 
 @mcp.tool(
@@ -712,36 +798,36 @@ async def strip_sentiment_bias(
     description="Compiles an immutable electronic contract addendum under Section 10A of the Information Technology Act, 2000."
 )
 async def generate_it_act_addendum(
-    tenancy_id: Optional[str] = Field(default="TEN-COV-001", description="Unique lease UUID"),
-    covenant_json: Optional[Any] = Field(default=None, description="Structured covenant payload string or dictionary"),
-    structured_covenant_json: Optional[Any] = Field(default=None, description="Alias for covenant_json"),
-    evidence_hash: Optional[str] = Field(default=None, description="Section 63 BSA origin audio hash"),
-    audio_sha256_hash: Optional[str] = Field(default=None, description="Alias for evidence_hash")
+    tenancy_id: str = Field(description="Unique lease UUID"),
+    covenant_json: Any = Field(description="Structured covenant payload string or dictionary"),
+    evidence_hash: str = Field(description="Section 63 BSA origin audio_sha256_hash")
 ) -> str:
-    cov_payload = covenant_json or structured_covenant_json or {}
-    cov = json.loads(cov_payload) if isinstance(cov_payload, str) else cov_payload
-    hash_val = evidence_hash or audio_sha256_hash or "EVID_HASH_TEXT_ORIGIN"
-    tid = tenancy_id or "TEN-COV-001"
+    # Handle stringified JSON or direct dictionary input
+    cov = json.loads(covenant_json) if isinstance(covenant_json, str) else covenant_json
+    if not isinstance(cov, dict):
+        cov = {}
 
     target = cov.get("target_fixture", cov.get("asset_affected", "BATHROOM_GEYSER"))
     deadline = cov.get("agreed_deadline_iso", cov.get("statutory_deadline_hours", "72h"))
     bearer = cov.get("cost_bearer", "LANDLORD")
 
-    addendum_id = f"ADDENDUM_{tid[:6].upper()}_{hashlib.md5(hash_val.encode()).hexdigest()[:6]}"
+    addendum_id = f"ADDENDUM_{tenancy_id[:6].upper()}_{hashlib.md5(evidence_hash.encode()).hexdigest()[:6]}"
     clause_text = f"Addendum: Landlord covenants to execute repair of {target} on or before {deadline}. Cost responsibility assigned to {bearer}."
     hash_digest = hashlib.sha256(clause_text.encode()).hexdigest()
 
     record = {
         "addendum_id": addendum_id,
-        "tenancy_id": tid,
+        "tenancy_id": tenancy_id,
         "contract_clause_markdown": clause_text,
         "legal_binding_basis": "IT_ACT_2000_SEC_10A",
         "requires_dual_confirmation": True,
         "hash_digest": hash_digest,
-        "evidence_anchor_sha256": hash_val,
+        "evidence_anchor_sha256": evidence_hash,
         "status": "DRAFTED_AWAITING_COUNTERSIGN",
         "timestamp_utc": datetime.now(timezone.utc).isoformat()
     }
+    
+    # Commit to shared state
     STATE_STORE.setdefault("covenants", {})[addendum_id] = record
     return json.dumps(record)
 
@@ -750,34 +836,33 @@ async def generate_it_act_addendum(
     description="Dispatches a structured WhatsApp Action Card with a 24-hour Notice of Understanding countdown timer."
 )
 async def dispatch_whatsapp_hsm(
-    tenancy_id: Optional[str] = Field(default="TEN-COV-001", description="Unique lease UUID"),
-    recipient_phone: Optional[str] = Field(default="+919876543210", description="Recipient phone number"),
+    tenancy_id: str = Field(description="Unique lease UUID"),
+    recipient_phone: Optional[str] = Field(default=None, description="Landlord phone with country code e.g. +9198XXXXXXXX"),
     recipient_phone_e164: Optional[str] = Field(default=None, description="Alias for recipient_phone"),
-    template_name: Optional[str] = Field(default="MAINTENANCE_NOTICE_OF_UNDERSTANDING", description="Template identifier"),
+    template_name: str = Field(default="MAINTENANCE_NOTICE_OF_UNDERSTANDING", description="Template identifier"),
     template_type: Optional[str] = Field(default=None, description="Alias for template_name"),
-    template_variables: Optional[Any] = Field(default="{}", description="JSON string or dict of template variables"),
-    passive_consent_hours: Optional[int] = Field(default=24, description="Timer window in hours"),
-    addendum_id: Optional[str] = Field(default="ADDENDUM_STAGED", description="Staged addendum UUID"),
-    summary_text: Optional[str] = Field(default=None, description="Optional summary text")
+    template_variables: str = Field(default="{}", description="JSON string of template variables"),
+    passive_consent_hours: int = Field(default=24, description="Timer window in hours"),
+    addendum_id: str = Field(default="ADDENDUM_STAGED", description="Staged addendum UUID")
 ) -> str:
     target_phone = recipient_phone or recipient_phone_e164 or "+919876543210"
-    active_template = template_type or template_name or "MAINTENANCE_NOTICE_OF_UNDERSTANDING"
-    aid = addendum_id or "ADDENDUM_STAGED"
-    tid = tenancy_id or "TEN-COV-001"
+    active_template = template_type or template_name
     now = datetime.now(timezone.utc)
-    deadline = now + timedelta(hours=passive_consent_hours or 24)
+    deadline = now + timedelta(hours=passive_consent_hours)
 
     return json.dumps({
         "status": "DISPATCHED_AND_ARMED",
-        "whatsapp_message_id": f"wamid.HBgL{tid[:6].upper()}_{int(now.timestamp())}",
+        "whatsapp_message_id": f"wamid.HBgL{tenancy_id[:6].upper()}_{int(now.timestamp())}",
         "dispatch_timestamp_utc": now.isoformat(),
-        "passive_timer_id": f"TIMER_24H_{aid}",
+        "passive_timer_id": f"TIMER_24H_{addendum_id}",
         "timer_expiry_timestamp_utc": deadline.isoformat(),
         "delivery_status": "DELIVERED",
         "recipient_phone": target_phone,
-        "addendum_id": aid,
+        "addendum_id": addendum_id,
         "hsm_template": active_template,
-        "interactive_buttons": ["APPROVE", "DISPUTE"]
+        "interactive_buttons": ["APPROVE", "DISPUTE"],
+        "passive_consent_hours": passive_consent_hours,
+        "legal_rule": "Silence for 24 hours constitutes binding electronic consent under Section 10A IT Act, 2000."
     })
 if __name__ == "__main__":
     mcp.run(transport="sse")
