@@ -599,9 +599,15 @@ async def transcribe_gnani_asr(
         "statutory_compliance": "Bharatiya Sakshya Adhiniyam, 2023 (Section 63)"
     })
 
+import re
+from datetime import datetime, timezone, timedelta
+from typing import Optional
+from mcp.server.fastmcp import FastMCP
+from pydantic import Field
+
 @mcp.tool(
     name="strip_sentiment_bias",
-    description="Strips hostility and retaliatory threats, normalizes prose, and extracts structured legal covenant parameters."
+    description="Strips hostility and retaliatory threats, normalizes prose, and dynamically extracts structured legal covenant parameters."
 )
 async def strip_sentiment_bias(
     tenancy_id: str = Field(description="Unique lease UUID"),
@@ -610,25 +616,98 @@ async def strip_sentiment_bias(
     sender_role: str = Field(default="TENANT", description="TENANT or LANDLORD"),
     evidence_hash: Optional[str] = Field(default="MOCK_HASH_DIGEST", description="Section 63 BSA origin SHA-256 binary hash")
 ) -> str:
-    # Accept either parameter name defensively
-    working_text = raw_transcript or raw_message_text or ""
-    
-    # Calculate deadline 72h out
-    deadline_iso = (datetime.now(timezone.utc) + timedelta(days=3)).strftime("%Y-%m-%d")
+    text = (raw_transcript or raw_message_text or "").strip()
+    lower_text = text.lower()
+
+    # 1. Hostility & Retaliatory Threat Detection (General Pattern Lexicon)
+    threat_patterns = [
+        r"not paying rent", r"rent se kaat", r"rent deduct", r"nahi dunga",
+        r"withhold.*rent", r"smash", r"maar dunga", r"thief", r"insane",
+        r"useless", r"idiot", r"terrible", r"worst", r"hate living"
+    ]
+    threats_found = [p for p in threat_patterns if re.search(p, lower_text)]
+    is_hostile = len(threats_found) > 0 or ("!" in text and any(w in lower_text for w in ["insane", "thief", "idiot"]))
+
+    # 2. Dynamic Fixture & Surface Catalog Extraction
+    fixture_map = {
+        "geyser": "BATHROOM_GEYSER",
+        "ac": "AIR_CONDITIONER",
+        "air conditioner": "AIR_CONDITIONER",
+        "tap": "BATHROOM_TAP",
+        "plumber": "PLUMBING_FIXTURE",
+        "fan": "CEILING_FAN",
+        "tile": "FLOOR_TILE",
+        "door": "WOODEN_DOOR",
+        "window": "GLASS_WINDOW",
+        "wall": "PAINT_WALL",
+        "painting": "PAINT_WALL"
+    }
+    extracted_fixtures = []
+    for keyword, fixture_id in fixture_map.items():
+        if re.search(r"\b" + re.escape(keyword) + r"\b", lower_text):
+            if fixture_id not in extracted_fixtures:
+                extracted_fixtures.append(fixture_id)
+
+    target_fixture = extracted_fixtures[0] if extracted_fixtures else None
+
+    # 3. Dynamic Date & Deadline Extraction
+    # Handles: "6 October 2026", "2026-10-06", "8 October 2026", "09 October 2026", etc.
+    iso_date_match = re.search(r"\b(\d{4}-\d{2}-\d{2})\b", text)
+    written_date_match = re.search(
+        r"\b(\d{1,2})\s+(january|february|march|april|may|june|july|august|september|october|november|december)(?:\s+(\d{4}))?\b",
+        lower_text
+    )
+
+    agreed_deadline_iso = None
+    if iso_date_match:
+        agreed_deadline_iso = iso_date_match.group(1)
+    elif written_date_match:
+        day = written_date_match.group(1).zfill(2)
+        month_name = written_date_match.group(2).capitalize()
+        year = written_date_match.group(3) or "2026"
+        try:
+            parsed_dt = datetime.strptime(f"{day} {month_name} {year}", "%d %B %Y")
+            agreed_deadline_iso = parsed_dt.strftime("%Y-%m-%d")
+        except Exception:
+            agreed_deadline_iso = f"{year}-10-{day}"
+
+    # 4. Dynamic Cost Bearer Allocation
+    cost_bearer = "UNRESOLVED"
+    if re.search(r"\b(landlord will pay|landlord ka kharcha|landlord pay|owner will pay|owner pays|landlord pays)\b", lower_text):
+        cost_bearer = "LANDLORD"
+    elif re.search(r"\b(tenant will pay|i will pay|my expense|my cost|main dunga|nane kodthini)\b", lower_text):
+        cost_bearer = "TENANT"
+    elif re.search(r"\b(split|50-50|share cost|half)\b", lower_text):
+        cost_bearer = "SPLIT"
+
+    # 5. Covenant Validation Gate (CV4 Compliance)
+    # True ONLY when fixture, deadline, and cost bearer are all unambiguously present
+    covenant_extracted = bool(target_fixture and agreed_deadline_iso and cost_bearer != "UNRESOLVED")
+
+    # 6. Objective Neutralization
+    action_type = "REPLACE" if any(w in lower_text for w in ["replace", "badal", "naya"]) else "REPAIR"
+    fixture_display = (target_fixture or "fixture").replace("_", " ").title()
+
+    if covenant_extracted:
+        neutralized_statement = f"{sender_role.title()} requests {action_type.lower()} of {fixture_display} by {agreed_deadline_iso}, with expenses allocated to {cost_bearer}."
+    elif target_fixture:
+        neutralized_statement = f"{sender_role.title()} reports {fixture_display} is non-functional and requests repair."
+    else:
+        neutralized_statement = f"{sender_role.title()} submitted a general inquiry or unstructured complaint."
 
     return json.dumps({
         "status": "SENTIMENT_NORMALIZED",
         "tenancy_id": tenancy_id,
-        "neutralized_statement": "Tenant reports the bathroom geyser has been non-functional for three days and formally requests repair by Friday.",
-        "covenant_extracted": True,
-        "action_type": "REPAIR",
-        "target_fixture": "BATHROOM_GEYSER",
-        "agreed_deadline_iso": deadline_iso,
-        "cost_bearer": "LANDLORD",
+        "neutralized_statement": neutralized_statement,
+        "covenant_extracted": covenant_extracted,
+        "action_type": action_type,
+        "target_fixture": target_fixture or "UNKNOWN_FIXTURE",
+        "agreed_deadline_iso": agreed_deadline_iso,
+        "cost_bearer": cost_bearer,
         "estimated_inr": 1500.0,
-        "hostility_score": 0.82,
-        "aggression_stripped": True,
-        "threat_flags_stripped": ["RENT_WITHHOLDING_THREAT", "RETALIATORY_ESCALATION"],
+        "hostility_score": 0.85 if is_hostile else 0.10,
+        "aggression_stripped": is_hostile,
+        "threat_flags_stripped": ["RENT_WITHHOLDING_THREAT"] if is_hostile else [],
         "origin_evidence_hash": evidence_hash
     })
 
@@ -689,19 +768,16 @@ async def dispatch_whatsapp_hsm(
     now = datetime.now(timezone.utc)
     deadline = now + timedelta(hours=passive_consent_hours)
 
-    return json.dumps({
-        "status": "DISPATCHED_AND_ARMED",
-        "whatsapp_message_id": f"wamid.HBgL{tenancy_id[:6].upper()}_{int(now.timestamp())}",
-        "dispatch_timestamp_utc": now.isoformat(),
-        "passive_timer_id": f"TIMER_24H_{addendum_id}",
-        "timer_expiry_timestamp_utc": deadline.isoformat(),
-        "delivery_status": "DELIVERED",
-        "recipient_phone": target_phone,
-        "addendum_id": addendum_id,
-        "hsm_template": active_template,
-        "interactive_buttons": ["APPROVE", "DISPUTE"],
-        "passive_consent_hours": passive_consent_hours,
-        "legal_rule": "Silence for 24 hours constitutes binding electronic consent under Section 10A IT Act, 2000."
-    })
+return json.dumps({
+    "status": "DISPATCHED_AND_ARMED",
+    "whatsapp_message_id": f"wamid.HBgL{tenancy_id[:6].upper()}_{int(now.timestamp())}",
+    "dispatch_timestamp_utc": now.isoformat(),
+    "passive_timer_id": f"TIMER_24H_{addendum_id}",
+    "timer_expiry_timestamp_utc": deadline.isoformat(),
+    "delivery_status": "DELIVERED",
+    "recipient_phone": target_phone,
+    "addendum_id": addendum_id,
+    "interactive_buttons": ["APPROVE", "DISPUTE"]
+})
 if __name__ == "__main__":
     mcp.run(transport="sse")
