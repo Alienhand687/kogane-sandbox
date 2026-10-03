@@ -61,6 +61,17 @@ STATIC_FIXTURES: Dict[str, Dict[str, Any]] = {
     }
 }
 
+# Merge 100-scenario adversarial evaluation suite into STATIC_FIXTURES
+try:
+    from eval_fixtures_100 import STATIC_FIXTURES as EVAL_100
+    STATIC_FIXTURES.update(EVAL_100)
+except ImportError:
+    try:
+        from sandbox.eval_fixtures_100 import STATIC_FIXTURES as EVAL_100
+        STATIC_FIXTURES.update(EVAL_100)
+    except ImportError:
+        pass
+
 
 # ============================================================================
 # GRANTEX LEAST-PRIVILEGE SCOPE REGISTRY & MOCK VALIDATOR
