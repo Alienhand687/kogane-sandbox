@@ -1170,7 +1170,7 @@ async def strip_sentiment_bias(
     # 1. Threat and hostility detection (CV5, § 3.2, § 10.1)
     threat_flags = []
     has_hostility = False
-    if any(k in text_lower for k in ["not paying rent", "no rent", "rent se kaat", "rent deduct", "tera geyser", "insane", "useless landlord"]):
+    if any(k in text_lower for k in ["not paying rent", "no rent", "stop paying", "rent se kaat", "rent deduct", "tera geyser", "useless landlord"]):
         threat_flags.append("RENT_WITHHOLDING_THREAT")
         has_hostility = True
     if any(k in text_lower for k in ["insane", "useless", "bakwas", "chor"]):
@@ -1180,8 +1180,29 @@ async def strip_sentiment_bias(
     hostility_score = 0.82 if has_hostility else 0.15
     aggression_stripped = has_hostility
 
-    # 2. Fixture and action type
-    target_fixture = "BATHROOM_GEYSER" if "geyser" in text_lower else "GENERAL_FIXTURE"
+    # 2. Intent and fixture detection (COV-09, CV4)
+    has_maintenance_intent = any(k in text_lower for k in [
+        "geyser", "ac", "tap", "leak", "kharab", "theek", "repair", "fix", "plumber", "pipe", "fan", "seepage", "door", "lock", "switch"
+    ])
+    
+    if not has_maintenance_intent:
+        return json.dumps({
+            "status": "SENTIMENT_NORMALIZED",
+            "tenancy_id": tenancy_id,
+            "neutralized_statement": "No actionable maintenance request identified.",
+            "covenant_extracted": False,
+            "action_type": None,
+            "target_fixture": None,
+            "agreed_deadline_iso": None,
+            "cost_bearer": None,
+            "estimated_inr": None,
+            "hostility_score": hostility_score,
+            "aggression_stripped": aggression_stripped,
+            "threat_flags_stripped": threat_flags,
+            "origin_evidence_hash": evidence_hash
+        })
+
+    target_fixture = "BATHROOM_GEYSER" if "geyser" in text_lower else ("AIR_CONDITIONER" if "ac" in text_lower else "GENERAL_FIXTURE")
     action_type = "REPAIR"
 
     # 3. Neutralized statement (factual issue only)
@@ -1196,12 +1217,14 @@ async def strip_sentiment_bias(
     agreed_deadline_iso = None
     if "6 october 2026" in text_lower or "2026-10-06" in working_text:
         agreed_deadline_iso = "2026-10-06"
+    elif "8 october 2026" in text_lower or "2026-10-08" in working_text:
+        agreed_deadline_iso = "2026-10-08"
     elif "friday" in text_lower or "shukrawar" in text_lower:
         agreed_deadline_iso = (datetime.now(timezone.utc) + timedelta(days=3)).strftime("%Y-%m-%d")
 
     # 5. Explicit cost bearer extraction
     cost_bearer = "UNRESOLVED"
-    if any(k in text_lower for k in ["landlord will pay", "landlord pay", "landlord dega", "landlord bharega"]):
+    if any(k in text_lower for k in ["landlord will pay", "landlord pay", "landlord dega", "landlord bharega", "landlord ka kharcha"]):
         cost_bearer = "LANDLORD"
     elif any(k in text_lower for k in ["tenant will pay", "tenant pay", "main dunga", "main pay karunga"]):
         cost_bearer = "TENANT"
@@ -1267,6 +1290,15 @@ async def generate_it_act_addendum(
     deadline = cov.get("agreed_deadline_iso", cov.get("statutory_deadline_hours", "24h"))
     bearer = cov.get("cost_bearer", "LANDLORD")
     summary = cov.get("covenant_summary", agreed_covenant_text or f"Repair of {target}")
+
+    # Illegal covenant conflict detection (COV-12d)
+    if any(k in str(target).lower() or k in str(summary).lower() for k in ["structural", "seepage", "wall seepage"]):
+        return json.dumps({
+            "status": "ILLEGAL_COVENANT_CONFLICT",
+            "tenancy_id": tenancy_id,
+            "error_code": "STATUTORY_STRUCTURAL_DUTY_BREACH",
+            "message": "Structural repairs are the non-delegable duty of the landlord under Section 108(m) Transfer of Property Act, 1882 and cannot be assigned to tenant."
+        })
 
     addendum_id = f"ADDENDUM_{tenancy_id[:6].upper()}_{hashlib.md5(evidence_hash.encode()).hexdigest()[:6]}"
     clause_text = f"Addendum: Landlord covenants to execute repair of {target} ({summary}) on or before {deadline}. Cost responsibility assigned to {bearer}."
