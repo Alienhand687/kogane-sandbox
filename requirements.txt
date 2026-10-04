@@ -2,3 +2,4 @@ mcp<2
 pydantic
 uvicorn
 httpx
+starlette

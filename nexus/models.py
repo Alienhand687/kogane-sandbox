@@ -67,7 +67,7 @@ class DeductionPackage(BaseModel):
     tenancy_id: str
     inspection_status: str
     total_allowable_deduction_inr: Optional[float] = None
-    delta_vector: Optional[List[Dict[str, Any]]] = None
+    delta_vector: Optional[Union[List[Dict[str, Any]], Dict[str, Any]]] = None
     reason_codes: List[str] = Field(default_factory=list)
     next_recommended_state: str
     hitl_brief: Optional[Dict[str, Any]] = None

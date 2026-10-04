@@ -224,11 +224,13 @@ class NexusOrchestrator:
         Arms 24-hour passive consent window.
         """
         asr_res = await self._call_tool("transcribe_gnani_asr", {
+            "tenancy_id": self.profile.tenancy_id,
             "audio_stream_uri": audio_stream_uri
         })
         raw_text = asr_res.get("normalized_english_text", asr_res.get("original_transcript", ""))
 
         strip_res = await self._call_tool("strip_sentiment_bias", {
+            "tenancy_id": self.profile.tenancy_id,
             "raw_transcript": raw_text,
             "sender_role": "TENANT"
         })
@@ -236,21 +238,27 @@ class NexusOrchestrator:
 
         addendum_res = await self._call_tool("generate_it_act_addendum", {
             "tenancy_id": self.profile.tenancy_id,
-            "agreed_covenant_text": neutral_covenant,
-            "landlord_id": self.profile.landlord_id,
-            "tenant_id": self.profile.tenant_id,
-            "source_audio_hash": asr_res.get("audio_sha256_hash", "HASH_AUDIO_MOCK")
+            "covenant_json": {
+                "target_fixture": "MAINTENANCE_ITEM",
+                "agreed_deadline_iso": "24h",
+                "cost_bearer": "LANDLORD",
+                "covenant_summary": neutral_covenant
+            },
+            "evidence_hash": asr_res.get("audio_sha256_hash", "HASH_AUDIO_MOCK"),
+            "agreed_covenant_text": neutral_covenant
         })
 
+        addendum_id = addendum_res.get("addendum_id", "ADD_01")
         hsm_res = await self._call_tool("dispatch_whatsapp_hsm", {
+            "tenancy_id": self.profile.tenancy_id,
             "recipient_phone": landlord_phone,
             "template_name": "MAINTENANCE_NOTICE_OF_UNDERSTANDING",
-            "template_variables": {
+            "addendum_id": addendum_id,
+            "template_variables": json.dumps({
                 "covenant_summary": neutral_covenant,
-                "addendum_id": addendum_res.get("addendum_id", "ADD_01"),
+                "addendum_id": addendum_id,
                 "statutory_reference": "Section 10A Information Technology Act 2000"
-            },
-            "tenancy_id": self.profile.tenancy_id
+            })
         })
 
         # Arm 24-Hour Passive Consent Timer
